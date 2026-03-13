@@ -1,0 +1,237 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman"],
+    "mathtext.fontset": "stix",
+    "axes.labelsize": 18,
+    "xtick.labelsize": 14,
+    "ytick.labelsize": 14,
+    "lines.linewidth": 2.5,
+    "axes.linewidth": 1.2
+})
+
+r = 0.05
+k = 2.0
+k2 = 0.01
+a = 0.05
+
+delta_c = 0.5
+s = 1.0
+alpha = 0.5
+beta = 0.5
+k_sigma = 1.0
+
+L_l = 1.0
+L_g = 1.0
+L_avg = 1.0
+
+k_c = 1.0
+N_0 = 1.0
+
+gamma1 = 1.0
+tau1 = 1.0
+k_t = 1.0
+delta_t = 0.1
+delta_g = 0.1
+gamma2 = 1.0
+tau2 = 1.0
+
+k_g_nom = 1.0
+k_G = 1.0
+kappa_temp = 0.2
+
+
+def P_ref(t):
+    return 1.0 + 1.0 / (1.0 + np.exp(-a * (t - 1000.0)))
+
+
+def dP_ref(t):
+    exp_term = np.exp(-a * (t - 1000.0))
+    return a * exp_term / (1.0 + exp_term) ** 2
+
+
+def ddP_ref(t):
+    exp_term = np.exp(-a * (t - 1000.0))
+    return -(a ** 2) * exp_term * (1.0 - exp_term) / (1.0 + exp_term) ** 3
+
+
+def k_g_T(temp_c):
+    exp_arg = np.clip(2.0 * (temp_c - 37.5), -100.0, 100.0)
+    return k_g_nom / (1.0 + np.exp(exp_arg))
+
+
+def k_cat(sigma):
+    return np.exp(-(sigma ** 2) / s)
+
+
+def k_cat_star(P, P_r, dP_r):
+    denom = r * (P - P ** 2 / k)
+    if abs(denom) < 1e-6:
+        return 1.0
+    return (dP_r + k2 * (P_r - P)) / denom
+
+
+def sigma_desired(P, P_r, dP_r):
+    sigma_max = 3.0
+    k_star = k_cat_star(P, P_r, dP_r)
+
+    if k_star >= 1.0:
+        return 0.0
+    if k_star <= 0.0:
+        return sigma_max
+    return min(np.sqrt(-s * np.log(np.clip(k_star, 1e-6, 1.0 - 1e-6))), sigma_max)
+
+
+def sigma_d_dot(P, P_r, dP_r, ddP_r_val, dP):
+    denom = r * (P - P ** 2 / k)
+
+    if abs(denom) < 1e-6:
+        k_star = 1.0
+    else:
+        k_star = (dP_r + k2 * (P_r - P)) / denom
+
+    if k_star >= 1.0 or k_star <= 0.0:
+        return 0.0
+
+    N = dP_r + k2 * (P_r - P)
+    D = r * (P - P ** 2 / k)
+
+    dN = ddP_r_val + k2 * (dP_r - dP)
+    dD = r * dP * (1.0 - 2.0 * P / k)
+
+    dk_star_dt = (dN * D - N * dD) / (D ** 2)
+    sigma_d_val = np.sqrt(-s * np.log(k_star))
+
+    if sigma_d_val < 1e-8:
+        return 0.0
+
+    return -s * dk_star_dt / (2.0 * sigma_d_val * k_star)
+
+
+def compute_G_d(sigma, sigma_d, sigma_d_dot_val, sigma_delta, T_state):
+    num = (
+        delta_c * sigma_delta * L_avg / L_g
+        + tau2 * T_state * np.exp(-beta * sigma)
+        - sigma_d_dot_val
+        + k_sigma * (sigma - sigma_d)
+    )
+    den = gamma2 * np.exp(alpha * sigma)
+    return num / den
+
+
+def compensation_factor():
+    return (tau1 / gamma1) / (tau2 / gamma2)
+
+
+def invert_temp(sigma_d, G, G_d):
+    num = k_g_nom * np.exp(sigma_d ** 2 / s)
+    denom = k_G * (G - G_d) + delta_g * G
+    frac = num / denom - 1.0
+
+    if frac <= 1e-6:
+        frac = 1e-6
+
+    return 37.5 + 0.5 * np.log(frac)
+
+
+def full_system_ode(t, x):
+    P, sigma, sigma_delta, sigma_plus, sigma_minus, G, T_state, T_actual = x
+
+    kcat = k_cat(sigma)
+
+    dP = r * kcat * (P - P ** 2 / k)
+
+    dsigma = (
+        delta_c * sigma_delta * L_avg / L_g
+        - gamma2 * G * np.exp(alpha * sigma)
+        + tau2 * T_state * np.exp(-beta * sigma)
+    )
+
+    dsigma_plus = k_c * kcat * N_0 / L_l - (delta_c + gamma1 * G / L_l) * sigma_plus
+    dsigma_minus = k_c * kcat * N_0 / L_l - (delta_c + tau1 * T_state / L_l) * sigma_minus
+
+    dsigma_delta = (
+        -delta_c * sigma_delta
+        - gamma1 * G * sigma_plus / L_l
+        + tau1 * T_state * sigma_minus / L_l
+    )
+
+    dT_state = k_t * kcat - delta_t * T_state
+
+    P_r = P_ref(t)
+    dP_r_val = dP_ref(t)
+    ddP_r_val = ddP_ref(t)
+
+    sigma_d = sigma_desired(P, P_r, dP_r_val)
+    sigma_d_dot_val = sigma_d_dot(P, P_r, dP_r_val, ddP_r_val, dP)
+
+    G_d_uncomp = compute_G_d(sigma, sigma_d, sigma_d_dot_val, sigma_delta, T_state)
+    G_d = compensation_factor() * G_d_uncomp
+
+    T_cmd = invert_temp(sigma_d, G, G_d)
+    dT = kappa_temp * (T_cmd - T_actual)
+
+    kg_eff = k_g_T(T_actual)
+    dG = kg_eff * kcat - delta_g * G
+
+    return [dP, dsigma, dsigma_delta, dsigma_plus, dsigma_minus, dG, dT_state, dT]
+
+
+t_span = (0.0, 2000.0)
+t_eval = np.linspace(0.0, 2000.0, 2000)
+
+x0 = [
+    0.1,
+    1.0,
+    0.5,
+    0.5,
+    0.5,
+    1.0,
+    1.0,
+    37.5
+]
+
+sol = solve_ivp(full_system_ode, t_span, x0, t_eval=t_eval)
+
+P_vals = sol.y[0]
+sigma_vals = sol.y[1]
+T_actual_vals = sol.y[7]
+
+P_ref_vals = np.array([P_ref(t) for t in sol.t])
+sigma_d_vals = np.array([
+    sigma_desired(P, P_ref(t), dP_ref(t))
+    for P, t in zip(P_vals, sol.t)
+])
+
+fig, axs = plt.subplots(3, 1, figsize=(10, 10.5), sharex=True)
+
+axs[0].plot(sol.t, P_vals, 'b-')
+axs[0].plot(sol.t, P_ref_vals, 'b--')
+axs[0].set_ylabel('OD600')
+axs[0].grid(True, alpha=0.3)
+axs[0].tick_params(labelbottom=False)
+
+axs[1].plot(sol.t, sigma_vals, 'r-')
+axs[1].plot(sol.t, sigma_d_vals, 'r--')
+axs[1].set_ylabel(r'$\sigma$ (turns/bp)')
+axs[1].grid(True, alpha=0.3)
+axs[1].tick_params(labelbottom=False)
+
+axs[2].plot(sol.t, T_actual_vals, 'g-')
+axs[2].set_ylabel('Temperature ($^\circ$C)')
+axs[2].set_xlabel('Time (Minutes)')
+axs[2].grid(True, alpha=0.3)
+
+plt.subplots_adjust(
+    top=0.98,
+    bottom=0.08,
+    left=0.12,
+    right=0.97,
+    hspace=0.12
+)
+
+plt.savefig("dynamics_figure_no_filter.png", dpi=300)
+plt.show()
